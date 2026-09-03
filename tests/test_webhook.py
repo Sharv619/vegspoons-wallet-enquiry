@@ -6,12 +6,15 @@ import hashlib
 from moto import mock_aws
 import boto3
 from src.app import lambda_handler
+from src.secrets import clear_secret_cache
 
 
 def generate_stripe_header(payload: str, secret: str, timestamp: int) -> str:
     signed_payload = f"{timestamp}.{payload}"
     signature = hmac.new(
-        secret.encode("utf-8"), signed_payload.encode("utf-8"), hashlib.sha256
+        secret.encode("utf-8"),
+        signed_payload.encode("utf-8"),
+        hashlib.sha256,
     ).hexdigest()
     return f"t={timestamp},v1={signature}"
 
@@ -29,12 +32,16 @@ def aws_setup(monkeypatch):
         "arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:stripe",
     )
 
+    clear_secret_cache()
+
     with mock_aws():
         dynamodb = boto3.resource("dynamodb", region_name="ap-southeast-2")
         dynamodb.create_table(
             TableName="vegspoons_passes_dev",
             KeySchema=[{"AttributeName": "pass_id", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "pass_id", "AttributeType": "S"}],
+            AttributeDefinitions=[
+                {"AttributeName": "pass_id", "AttributeType": "S"}
+            ],
             BillingMode="PAY_PER_REQUEST",
         )
         dynamodb.create_table(
@@ -47,7 +54,9 @@ def aws_setup(monkeypatch):
         )
         dynamodb.create_table(
             TableName="vegspoons_scan_audit_dev",
-            KeySchema=[{"AttributeName": "pass_id_timestamp", "KeyType": "HASH"}],
+            KeySchema=[
+                {"AttributeName": "pass_id_timestamp", "KeyType": "HASH"}
+            ],
             AttributeDefinitions=[
                 {"AttributeName": "pass_id_timestamp", "AttributeType": "S"}
             ],
@@ -60,6 +69,7 @@ def aws_setup(monkeypatch):
             SecretString=json.dumps({"webhook_secret": "whsec_test_secret"}),
         )
         yield dynamodb
+        clear_secret_cache()
 
 
 def test_webhook_missing_signature(aws_setup):
