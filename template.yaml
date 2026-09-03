@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: VegSpoons Wallet Bridge Serverless Sidecar (ap-southeast-2)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment stage (dev, staging, prod)
+
+  StripeSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:vegspoons/prod/stripe-xyz
+    Description: ARN for Stripe secrets in AWS Secrets Manager
+
+  AppleSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:vegspoons/prod/apple-wallet-xyz
+    Description: ARN for Apple Wallet secrets in AWS Secrets Manager
+
+  GoogleSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:vegspoons/prod/google-wallet-xyz
+    Description: ARN for Google Wallet secrets in AWS Secrets Manager
+
+  MerchantAuthSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:vegspoons/prod/merchant-auth-xyz
+    Description: ARN for Merchant Auth secrets in AWS Secrets Manager
+
+Conditions:
+  IsSydneyRegion: !Equals [!Ref "AWS::Region", "ap-southeast-2"]
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: python3.12
+    Architecture: x86_64
+    Environment:
+      Variables:
+        STAGE: !Ref Environment
+        PASS_TABLE_NAME: !Ref WalletBridgePassesTable
+        IDEMPOTENCY_TABLE_NAME: !Ref WalletBridgeIdempotencyTable
+        SCAN_TABLE_NAME: !Ref WalletBridgeScansTable
+        TEMP_BUCKET_NAME: !Ref WalletBridgeArtifactsBucket
+        STRIPE_SECRET_ARN: !Ref StripeSecretArn
+        APPLE_SECRET_ARN: !Ref AppleSecretArn
+        GOOGLE_SECRET_ARN: !Ref GoogleSecretArn
+        MERCHANT_AUTH_SECRET_ARN: !Ref MerchantAuthSecretArn
+
+Resources:
+  # REST API Gateway
+  WalletBridgeApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,Stripe-Signature'"
+        AllowOrigin: "'*'"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: "INFO"
+          DataTraceEnabled: false
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 1000
+          ThrottlingRateLimit: 500
+
+  # Monolithic / Route-based Unified Lambda Handler
+  WalletBridgeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src.app.lambda_handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:ConditionCheck
+              Resource:
+                - !GetAtt WalletBridgePassesTable.Arn
+                - !Sub "${WalletBridgePassesTable.Arn}/index/*"
+                - !GetAtt WalletBridgeIdempotencyTable.Arn
+                - !GetAtt WalletBridgeScansTable.Arn
+                - !Sub "${WalletBridgeScansTable.Arn}/index/*"
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub "${WalletBridgeArtifactsBucket.Arn}/*"
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref StripeSecretArn
+                - !Ref AppleSecretArn
+                - !Ref GoogleSecretArn
+                - !Ref MerchantAuthSecretArn
+      Events:
+        WebhookEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WalletBridgeApi
+            Path: /webhook
+            Method: POST
+        VerifyEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WalletBridgeApi
+            Path: /verify
+            Method: POST
+
+  # CloudWatch Log Group
+  WalletBridgeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${WalletBridgeFunction}"
+      RetentionInDays: 14
+
+  # DynamoDB Tables
+  WalletBridgePassesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "vegspoons_passes_${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pass_id
+          AttributeType: S
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: state
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pass_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIndex
+          KeySchema:
+            - AttributeName: customer_id
+              KeyType: HASH
+            - AttributeName: state
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  WalletBridgeIdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "vegspoons_idempotency_${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stripe_event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stripe_event_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  WalletBridgeScansTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "vegspoons_scan_audit_${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pass_id_timestamp
+          AttributeType: S
+        - AttributeName: merchant_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pass_id_timestamp
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: MerchantIndex
+          KeySchema:
+            - AttributeName: merchant_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # S3 Temporary Bucket
+  WalletBridgeArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "vegspoons-wallet-artifacts-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTempArtifacts
+            Status: Enabled
+            ExpirationInDays: 1
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for API Gateway REST API
+    Value: !Sub "https://${WalletBridgeApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/"
+  WebhookEndpoint:
+    Description: Webhook intake endpoint URL
+    Value: !Sub "https://${WalletBridgeApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhook"
+  VerifyEndpoint:
+    Description: Verification endpoint URL
+    Value: !Sub "https://${WalletBridgeApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/verify"
